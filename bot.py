@@ -1,4 +1,4 @@
-import os, json, time, re, asyncio, requests
+import os, json, time, re, asyncio, requests, hashlib
 from bs4 import BeautifulSoup
 from telegram import Bot
 from requests.exceptions import RequestException
@@ -31,7 +31,6 @@ session = requests.Session()
 session.headers.update(HEADERS)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -41,11 +40,9 @@ def load_state():
             pass
     return {"last_id": None}
 
-
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
-
 
 def dedupe(items):
     uniq = {}
@@ -53,19 +50,20 @@ def dedupe(items):
         uniq[it["id"]] = it
     return list(uniq.values())[:20]
 
-
-# ---------- فیلتر سخت‌گیر برای شبیه Catalog 48 ----------
+# ---------- الگوهای دقیق‌تر ----------
 LISTING_PATTERN = re.compile(
     r"(binance will list|binance lists|listed on binance|will be listed on binance)",
     re.I
 )
 
-# هر چیزی که trading pair باشد حذف می‌شود
 PAIR_PATTERN = re.compile(
     r"(new trading pair|trading pair|spot trading|futures trading)",
     re.I
 )
 
+def normalize_id(text: str):
+    # یک id پایدار کوتاه برای state
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def parse_listedon(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -78,15 +76,13 @@ def parse_listedon(html):
 
         joined = " | ".join(cols).strip()
 
-        # حذف نویزهای trading pair
         if PAIR_PATTERN.search(joined):
             continue
 
-        # فقط لیستینگ‌های واقعی
         if LISTING_PATTERN.search(joined):
             title = joined
             items.append({
-                "id": title,
+                "id": normalize_id(title),
                 "title": title,
                 "date": cols[0] if cols else "",
                 "url": "https://listedon.org/en/exchange/binance",
@@ -94,22 +90,27 @@ def parse_listedon(html):
 
     return dedupe(items)
 
-
 def parse_coinlistingdate(html):
     soup = BeautifulSoup(html, "html.parser")
     items = []
 
-    for el in soup.select("a, h2, h3, li, div"):
+    # فقط تگ‌های لینک/عنوان را بررسی می‌کنیم تا متن مقاله جمع نشود
+    for el in soup.select("a, h2, h3"):
         t = el.get_text(" ", strip=True)
         if not t:
+            continue
+
+        # حذف متن‌های خیلی بلند (مقاله/description)
+        if len(t) > 220:
             continue
 
         if PAIR_PATTERN.search(t):
             continue
 
-        if LISTING_PATTERN.search(t):
+        # سخت‌گیرتر: ترجیحاً با "Binance Will List" شروع شود
+        if LISTING_PATTERN.search(t) and re.search(r"binance will list", t, re.I):
             items.append({
-                "id": t,
+                "id": normalize_id(t),
                 "title": t,
                 "date": "",
                 "url": "https://coinlistingdate.com/exchange/binance",
@@ -117,21 +118,32 @@ def parse_coinlistingdate(html):
 
     return dedupe(items)
 
-
 def parse_binance_html(html):
-    # فالو‌بک؛ ممکن است 403 بخورد، ولی اگر باز شد همان صفحه است
     soup = BeautifulSoup(html, "html.parser")
     items = []
     for a in soup.select('a[href*="/en/support/announcement/"]'):
         title = a.get_text(strip=True)
         href = a.get("href")
-        if title and href:
-            url = "https://www.binance.com" + href if href.startswith("/") else href
-            # باز هم همان الگوی لیستینگ را اعمال می‌کنیم
-            if LISTING_PATTERN.search(title) and not PAIR_PATTERN.search(title):
-                items.append({"id": url, "title": title, "date": "", "url": url})
-    return dedupe(items)
+        if not title or not href:
+            continue
 
+        # حذف متن‌های بلند احتمالی
+        if len(title) > 220:
+            continue
+
+        if PAIR_PATTERN.search(title):
+            continue
+
+        if LISTING_PATTERN.search(title):
+            url = "https://www.binance.com" + href if href.startswith("/") else href
+            items.append({
+                "id": normalize_id(url),
+                "title": title,
+                "date": "",
+                "url": url
+            })
+
+    return dedupe(items)
 
 def fetch_from_source(src, timeout=40):
     r = session.get(src["url"], timeout=timeout)
@@ -146,7 +158,6 @@ def fetch_from_source(src, timeout=40):
         return parse_binance_html(html)
 
     return []
-
 
 def fetch_items():
     for src in FEEDS:
@@ -163,6 +174,11 @@ def fetch_items():
                 time.sleep(2 + attempt)
     return []
 
+def truncate_for_telegram(text: str, limit=3500):
+    # تلگرام 4096 کاراکتر limit دارد؛ 3500 امن‌تر است
+    if len(text) <= limit:
+        return text
+    return text[:limit-3] + "..."
 
 async def send_item(it):
     msg = (
@@ -171,12 +187,13 @@ async def send_item(it):
         f"{it.get('date','')}\n"
         f"{it.get('url','')}"
     )
+    msg = truncate_for_telegram(msg)
+
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text=msg,
         disable_web_page_preview=False
     )
-
 
 async def main_loop_async():
     state = load_state()
@@ -204,7 +221,6 @@ async def main_loop_async():
             save_state(state)
 
         await asyncio.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
